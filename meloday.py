@@ -343,7 +343,7 @@ def sort_by_sonic_similarity_greedy(tracks, limit=20, max_distance=1.0):
     return sorted_list
 
 def generate_playlist_title_and_description(period, tracks):
-    descriptor_map = load_descriptor_map("moodmap.json")
+    descriptor_map = load_descriptor_map(MOOD_MAP_PATH)
     day_name = datetime.now().strftime("%A")
 
     top_genres = [str(g) for t in tracks for g in (t.genres or [])]
