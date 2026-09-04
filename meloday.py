@@ -1,3 +1,4 @@
+import sys
 import yaml
 import os
 import re
@@ -13,7 +14,10 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def load_config(filepath="config.yml"):
-    with open(os.path.join(BASE_DIR, filepath), "r", encoding="utf-8") as file:
+    path = os.path.join(BASE_DIR, filepath)
+    if not os.path.isfile(path):
+        raise FileNotFoundError("Missing config.yml: copy config.example.yml to config.yml and fill in your Plex settings.")
+    with open(path, "r", encoding="utf-8") as file:
         return yaml.safe_load(file)
 
 config = load_config()
@@ -26,6 +30,16 @@ EXCLUDE_PLAYED_DAYS = config["playlist"]["exclude_played_days"]
 HISTORY_LOOKBACK_DAYS = config["playlist"]["history_lookback_days"]
 MAX_TRACKS = config["playlist"]["max_tracks"]
 SONIC_SIMILAR_LIMIT = config["playlist"]["sonic_similar_limit"]
+
+HISTORICAL_RATIO = config["playlist"].get("historical_ratio", 0.3)
+SONIC_SIMILARITY_LIMIT = config["playlist"].get("sonic_similarity_limit", 20)
+SONIC_SIMILARITY_DISTANCE = config["playlist"].get("sonic_similarity_distance", 1.0)
+if not 0 <= HISTORICAL_RATIO <= 1:
+    raise ValueError("historical_ratio must be between 0 and 1")
+if MAX_TRACKS < 1 or SONIC_SIMILAR_LIMIT < 1 or SONIC_SIMILARITY_LIMIT < 1:
+    raise ValueError("Track counts and sonic limits must be positive")
+if SONIC_SIMILARITY_DISTANCE < 0:
+    raise ValueError("sonic_similarity_distance must be nonnegative")
 
 PERIOD_PHRASES = config["period_phrases"]
 def get_period_phrase(period):
@@ -127,44 +141,21 @@ def fetch_historical_tracks(period):
         if entry.ratingKey not in excluded_keys
     ]
 
-    # If no historical tracks found, fallback
-    if not filtered_tracks:
-        fallback_entries = [
-            entry for entry in music_section.history(mindate=history_start)
-            if entry.viewedAt and entry.viewedAt.hour in period_hours
-               and entry.ratingKey not in excluded_keys
-        ]
-        if fallback_entries:
-            filtered_tracks = fallback_entries
+    # History entries may be partial Plex objects. Resolve library tracks before
+    # filtering ratings or reading artist/album metadata.
+    play_counts = Counter(str(t.ratingKey) for t in filtered_tracks)
+    ordered_keys = sorted(play_counts, key=play_counts.get, reverse=True)
+    resolved = []
+    for key in ordered_keys:
+        try:
+            resolved.append(plex.fetchItem(int(key)))
+        except Exception as exc:
+            print(f"WARNING: Cannot resolve history track {key}: {exc}")
+    print(f"History: {len(history_entries)} plays in this time period; "
+          f"{len(ordered_keys)} unique tracks after recent-play exclusions; "
+          f"{len(resolved)} library tracks resolved.")
+    return resolved, excluded_keys
 
-    # Genre balancing
-    track_play_counts = Counter()
-    genre_count = Counter()
-    for track in filtered_tracks:
-        track_play_counts[track] += 1
-        for genre in track.grandparentTitle or []:
-            genre_count[genre] += 1
-
-    sorted_tracks = sorted(filtered_tracks, key=lambda t: track_play_counts[t], reverse=True)
-    split_index = max(1, len(sorted_tracks) // 4)
-    popular_tracks = sorted_tracks[:split_index]
-    rare_tracks = sorted_tracks[split_index:]
-
-    balanced_selection = (
-        random.sample(rare_tracks, min(len(rare_tracks), int(MAX_TRACKS * 0.75)))
-        + random.sample(popular_tracks, min(len(popular_tracks), int(MAX_TRACKS * 0.25)))
-    )
-
-    if genre_count:
-        most_common_genre, most_common_count = genre_count.most_common(1)[0]
-        max_genre_limit = int(MAX_TRACKS * 0.25)
-        if most_common_count > max_genre_limit:
-            balanced_selection = (
-                [t for t in balanced_selection if most_common_genre not in t.genres][:max_genre_limit]
-                + [t for t in balanced_selection if most_common_genre in t.genres][:max_genre_limit]
-            )
-
-    return balanced_selection, excluded_keys
 
 def filter_low_rated_tracks(tracks):
     """
@@ -182,17 +173,16 @@ def filter_low_rated_tracks(tracks):
             album_rating = getattr(album, "userRating", None) if album else None
             track_rating = getattr(track, "userRating", None)
 
-            if artist_rating is not None and artist_rating <= 2:
+            if artist_rating is not None and 0 < artist_rating <= 2:
                 continue
-            if album_rating is not None and album_rating <= 2:
+            if album_rating is not None and 0 < album_rating <= 2:
                 continue
-            if track_rating is not None and track_rating <= 2:
+            if track_rating is not None and 0 < track_rating <= 2:
                 continue
 
             filtered.append(track)
-        except Exception:
-            # Just skip if something goes wrong
-            pass
+        except Exception as exc:
+            print(f"WARNING: Rating check failed for {getattr(track, 'title', 'unknown track')}: {exc}")
     return filtered
 
 def clean_title(title):
@@ -231,7 +221,7 @@ def process_tracks(tracks):
     unique_tracks = []
     artist_count = Counter()
     genre_count = Counter()
-    artist_limit = round(MAX_TRACKS * 0.05)
+    artist_limit = max(1, round(MAX_TRACKS * 0.05))
 
     for track in filtered_tracks:
         try:
@@ -255,8 +245,8 @@ def process_tracks(tracks):
                 continue
 
             # Ensure genre balance
-            track_genre = track.genres[0] if track.genres else "Unknown"
-            if genre_count[track_genre] >= int(MAX_TRACKS * 0.15):
+            track_genre = str(getattr(track.genres[0], "tag", track.genres[0])) if track.genres else "Unknown"
+            if genre_count[track_genre] >= max(1, int(MAX_TRACKS * 0.15)):
                 continue
 
             # Store track as unique
@@ -264,8 +254,8 @@ def process_tracks(tracks):
             genre_count[track_genre] += 1
             unique_tracks.append(track)
 
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"WARNING: Track processing failed for {getattr(track, 'title', 'unknown track')}: {exc}")
 
     return unique_tracks
 
@@ -282,7 +272,7 @@ def fetch_sonically_similar_tracks(reference_tracks, excluded_keys=None):
 
     for track in reference_tracks:
         try:
-            similars = track.sonicallySimilar(limit=SONIC_SIMILAR_LIMIT)
+            similars = track.sonicallySimilar(limit=SONIC_SIMILAR_LIMIT, maxDistance=SONIC_SIMILARITY_DISTANCE)
 
             # Ensure we're filtering by last play date
             filtered_similars = []
@@ -367,24 +357,14 @@ def generate_playlist_title_and_description(period, tracks):
     highlight_styles = sorted_genres[:3] + sorted_moods[:3]
     highlight_styles = [s for s in highlight_styles if s not in {most_common_genre, most_common_mood}]
     highlight_styles = list(dict.fromkeys(highlight_styles))[:max_styles]
-    while len(highlight_styles) < max_styles:
-        additional = sorted_genres + sorted_moods
-        for s in additional:
-            if s not in highlight_styles:
-                highlight_styles.append(s)
-            if len(highlight_styles) == max_styles:
-                break
-
-    if second_common_mood:
-        description = (
-            f"You listened to {most_common_mood} and {most_common_genre} tracks on {day_name} {period_phrase}. "
-            f"Here's some {', '.join(highlight_styles[:-1])}, and {highlight_styles[-1]} tracks as well."
-        )
-    else:
-        description = (
-            f"You listened to {most_common_genre} and {most_common_mood} tracks on {day_name} {period_phrase}. "
-            f"Here's some {', '.join(highlight_styles[:-1])}, and {highlight_styles[-1]} tracks as well."
-        )
+    description = (
+        f"You listened to {most_common_mood} and {most_common_genre} tracks "
+        f"on {day_name} {period_phrase}."
+    )
+    if highlight_styles:
+        styles = (highlight_styles[0] if len(highlight_styles) == 1 else
+                  ", ".join(highlight_styles[:-1]) + " and " + highlight_styles[-1])
+        description += f" Here's some {styles} tracks as well."
 
     try:
         plex_account = plex.myPlexAccount()
@@ -402,7 +382,7 @@ def generate_playlist_title_and_description(period, tracks):
         next_update += timedelta(days=1)
 
     next_update_time = next_update.strftime("%I:%M %p").lstrip("0")
-    description += f"\n\nMade for {plex_user} • Next update at {next_update_time}."
+    description = f"Made for {plex_user} • Next update at {next_update_time}.\n{description}"
     return title, description
 
 def apply_text_to_cover(image_path, text):
@@ -465,7 +445,9 @@ def create_or_update_playlist(name, tracks, description, cover_file):
                 existing_playlist = playlist
                 break
 
-        valid_tracks = [t for t in tracks if hasattr(t, "ratingKey")]
+        valid_tracks = [t for t in tracks if getattr(t, "ratingKey", None)]
+        if not valid_tracks:
+            raise ValueError("Refusing to update a playlist with no valid tracks")
         if existing_playlist:
             existing_playlist.removeItems(existing_playlist.items())
             existing_playlist.addItems(valid_tracks)
@@ -479,8 +461,8 @@ def create_or_update_playlist(name, tracks, description, cover_file):
         if os.path.exists(cover_path):
             new_cover = apply_text_to_cover(cover_path, name)
             existing_playlist.uploadPoster(filepath=new_cover)
-    except Exception:
-        pass
+    except Exception as exc:
+        raise RuntimeError(f"Playlist update failed: {exc}") from exc
 
 def find_first_and_last_tracks(tracks, period):
     if not tracks:
@@ -510,48 +492,52 @@ def main():
     print_status(20, "Fetching historical tracks...")
     historical, excluded_keys = fetch_historical_tracks(period)
 
-    # Guarantee ~30% historical
-    guaranteed_count = int(MAX_TRACKS * 0.3)
+    # Limit direct history selections; history may still seed discovery at ratio zero.
+    historical = process_tracks(historical)
+    print(f"History: {len(historical)} tracks remain after rating and diversity filters.")
+    guaranteed_count = int(MAX_TRACKS * HISTORICAL_RATIO)
     guaranteed_historical = random.sample(historical, min(guaranteed_count, len(historical)))
+    reference_tracks = guaranteed_historical or historical[:MAX_TRACKS]
 
     # Step 2: Fetch similar
     print_status(30, "Fetching sonically similar tracks...")
-    similar = fetch_sonically_similar_tracks(guaranteed_historical, excluded_keys=excluded_keys)
+    similar = fetch_sonically_similar_tracks(reference_tracks, excluded_keys=excluded_keys)
 
     # Combine
     print_status(40, "Combining & processing tracks...")
     all_tracks = guaranteed_historical + similar
-    final_tracks = process_tracks(all_tracks)
+    final_tracks = process_tracks(all_tracks)[:MAX_TRACKS]
+    print(f"Selection: {len(guaranteed_historical)} history tracks, {len(similar)} sonic candidates, {len(final_tracks)} eligible tracks.")
 
     # Step 3: Ensure we reach MAX_TRACKS
     progress_step = 40
     while len(final_tracks) < MAX_TRACKS:
-        progress_step += 5
+        progress_step = min(65, progress_step + 5)
         print_status(progress_step, f"Attempting to add more tracks...")
 
-        more_historical, more_excluded = fetch_historical_tracks(period)
-        excluded_keys |= more_excluded
-        leftover_count = MAX_TRACKS - len(final_tracks)
-        leftover_historical = random.sample(more_historical, min(leftover_count, len(more_historical)))
-
+        previous_count = len(final_tracks)
         more_similar = fetch_sonically_similar_tracks(final_tracks, excluded_keys=excluded_keys)
-        additional_tracks = process_tracks(leftover_historical + more_similar)
-        final_tracks.extend(additional_tracks[:leftover_count])
-
-        if not additional_tracks:
+        final_tracks = process_tracks(final_tracks + more_similar)[:MAX_TRACKS]
+        if len(final_tracks) == previous_count:
             break
+
+    if not final_tracks:
+        raise ValueError("No eligible tracks found; existing playlist was left unchanged.")
 
     print_status(70, "Finding first & last historical tracks...")
     first_track, last_track = find_first_and_last_tracks(final_tracks[:MAX_TRACKS], period)
-    middle_tracks = [t for t in final_tracks[:MAX_TRACKS] if t not in {first_track, last_track}]
+    middle_tracks = [t for t in final_tracks[:MAX_TRACKS] if t not in (first_track, last_track)]
 
     # Step 4: Sonic sort (GREEDY)
     if middle_tracks:
         print_status(80, "Performing GREEDY sonic sort...")
-        middle_tracks = sort_by_sonic_similarity_greedy(middle_tracks)
+        middle_tracks = sort_by_sonic_similarity_greedy(
+            middle_tracks, limit=SONIC_SIMILARITY_LIMIT,
+            max_distance=SONIC_SIMILARITY_DISTANCE
+        )
 
     final_ordered_tracks = (
-        [first_track] + middle_tracks + [last_track]
+        [first_track] + middle_tracks + ([last_track] if last_track.ratingKey != first_track.ratingKey else [])
         if first_track and last_track else final_tracks[:MAX_TRACKS]
     )
 
@@ -564,4 +550,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,54 @@
+# Copy to config.yml and fill in your local Plex details.
+plex:
+  url: "http://localhost:32400"
+  token: ""
+  music_library: "Music"
+
+playlist:
+  exclude_played_days: 4
+  history_lookback_days: 30
+  max_tracks: 50
+  sonic_similar_limit: 8 # Discovery results per reference track
+  historical_ratio: 0.3 # Maximum direct history selections as a fraction of max_tracks
+  sonic_similarity_limit: 50 # Results per reference when sorting
+  sonic_similarity_distance: 1.0 # Maximum distance for discovery and sorting
+
+directories:
+  cover_images: "assets/covers/flat"
+  fonts: "assets/fonts"
+fonts:
+  main: "Circular/Circular-Bold.ttf"
+  meloday: "Circular/Circular-Bold.ttf"
+files:
+  mood_map: "assets/moodmap.json"
+
+time_periods:
+  Dawn:
+    hours: [3, 4, 5]
+    cover: "dawn_blank.webp"
+  Early Morning:
+    hours: [6, 7, 8]
+    cover: "early-morning_blank.webp"
+  Morning:
+    hours: [9, 10, 11]
+    cover: "morning_blank.webp"
+  Afternoon:
+    hours: [12, 13, 14, 15]
+    cover: "afternoon_blank.webp"
+  Evening:
+    hours: [16, 17, 18]
+    cover: "evening_blank.webp"
+  Night:
+    hours: [19, 20, 21]
+    cover: "night_blank.webp"
+  Late Night:
+    hours: [22, 23, 0, 1, 2]
+    cover: "late-night_blank.webp"
+period_phrases:
+  Dawn: "at dawn"
+  Early Morning: "in the early morning"
+  Morning: "in the morning"
+  Afternoon: "during the afternoon"
+  Evening: "in the evening"
+  Night: "at night"
+  Late Night: "late at night"
